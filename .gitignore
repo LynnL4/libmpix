@@ -1,4 +1,19 @@
+.vscode/
 build
 *.log
 .cache
 compile_commands.json
+
+// Ignore all image files
+*.gif
+*.jpeg
+*.tiff
+*.webp
+*.svg
+*.qoi
+*.jpg
+*.png
+*.raw
+*.bmp
+*.yuv
+*.rgb

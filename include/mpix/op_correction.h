@@ -52,6 +52,42 @@ struct mpix_correction_black_level {
 };
 
 /**
+ * @brief Lens shading correction parameters
+ * 
+ * Lens shading correction compensates for the vignetting effect where
+ * the image becomes darker towards the edges due to optical limitations.
+ * The algorithm applies a radial gain function based on distance from center.
+ */
+struct mpix_correction_lens_shading {
+	/** Center X coordinate (typically image_width/2) */
+	uint16_t center_x;
+	/** Center Y coordinate (typically image_height/2) */
+	uint16_t center_y;
+	/** 
+	 * Radial correction strength (Q10.6 fixed-point format, multiplied by 1024)
+	 * Range: -4096 to +4096 (-4.0 to +4.0)
+	 * Positive values: brighten edges progressively (correct dark vignetting)
+	 *   - Center stays unchanged, edges get brighter
+	 * Negative values: brighten center progressively (spotlight effect)
+	 *   - Edges stay unchanged, center gets brighter
+	 * Typical values: ±1024-2048 (±1.0-2.0) for moderate effects
+	 */
+	int16_t strength;
+	/** 
+	 * Radial falloff exponent (Q10.6 fixed-point format, multiplied by 1024)
+	 * Range: 102 to 4096 (0.1 to 4.0, supports fractional values)
+	 * Controls the steepness of the radial falloff curve:
+	 * - Small values (0.1-0.9): very gentle, wide spread effect
+	 * - 1.0: Linear falloff (proportional to distance)
+	 * - 1.5-2.5: Moderate falloff (balanced, commonly used)
+	 * - 3.0-4.0: Sharp falloff (concentrated near edges)
+	 * Mathematical effect: factor = (distance/max_distance)^exponent
+	 * Higher exponent = steeper falloff, more concentrated correction
+	 */
+	uint16_t exponent;
+};
+
+/**
  * @brief Aggregation of all possible correction types
  */
 struct mpix_correction_all {
@@ -63,6 +99,8 @@ struct mpix_correction_all {
 	struct mpix_correction_gamma gamma;
 	/** Storage for the black level correction controls */
 	struct mpix_correction_black_level black_level;
+	/** Storage for the lens shading correction controls */
+	struct mpix_correction_lens_shading lens_shading;
 };
 
 /**
@@ -77,6 +115,8 @@ union mpix_correction_any {
 	struct mpix_correction_gamma gamma;
 	/** Option for the black level correction controls */
 	struct mpix_correction_black_level black_level;
+	/** Option for the lens shading correction controls */
+	struct mpix_correction_lens_shading lens_shading;
 };
 
 /**
@@ -91,6 +131,8 @@ enum mpix_correction_type {
 	MPIX_CORRECTION_GAMMA,
 	/** Apply color correction to every pixel*/
 	MPIX_CORRECTION_COLOR_MATRIX,
+	/** Apply lens shading correction to compensate for vignetting */
+	MPIX_CORRECTION_LENS_SHADING,
 };
 
 /**
@@ -158,6 +200,14 @@ void mpix_correction_white_balance_rgb24(const uint8_t *src, uint8_t *dst, uint1
  */
 void mpix_correction_color_matrix_rgb24(const uint8_t *src, uint8_t *dst, uint16_t width,
 					uint16_t line_offset, union mpix_correction_any *corr);
+
+/**
+ * @brief Perform lens shading correction of an input line in RGB24 pixel format.
+ * @copydetails mpix_correction_black_level_raw8
+ */
+void mpix_correction_lens_shading_rgb24(const uint8_t *src, uint8_t *dst, uint16_t width,
+					uint16_t line_offset, union mpix_correction_any *corr);
+
 /**
  * @brief Helper to simplify the implementation of a image correction operation.
  *

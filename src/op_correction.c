@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <errno.h>
+#include <math.h>
 
 #include <mpix/genlist.h>
 #include <mpix/image.h>
@@ -156,7 +157,7 @@ void mpix_correction_gamma_rgb24(const uint8_t *src, uint8_t *dst, uint16_t widt
 MPIX_REGISTER_CORRECTION_OP(gc_rgb24, mpix_correction_gamma_rgb24, GAMMA, RGB24);
 
 void mpix_correction_color_matrix_rgb24(const uint8_t *src, uint8_t *dst, uint16_t width,
-		                        uint16_t line_offset, union mpix_correction_any *corr)
+					uint16_t line_offset, union mpix_correction_any *corr)
 {
 	uint16_t *levels = corr->color_matrix.levels;
 
@@ -183,6 +184,133 @@ void mpix_correction_color_matrix_rgb24(const uint8_t *src, uint8_t *dst, uint16
 }
 MPIX_REGISTER_CORRECTION_OP(ccm_rgb24, mpix_correction_color_matrix_rgb24, COLOR_MATRIX, RGB24);
 
+static inline int32_t mpix_sqrt_q10(int32_t x_q20)
+{
+    if (x_q20 <= 0) return 0;
+    
+    int32_t result = x_q20 >> 1;
+    
+    for (int i = 0; i < 3; i++) {
+        if (result == 0) break;
+        result = (result + (x_q20 / result)) >> 1;
+    }
+    
+    return result >> 5;
+}
+
+static inline int32_t mpix_pow_lsc_q10(int32_t base_q10, int32_t exp_q10)
+{
+    if (base_q10 <= 0) return 0;
+    if (base_q10 >= 1024) return 1024;
+    if (exp_q10 == 1024) return base_q10;
+    
+    if (exp_q10 <= 1024) {
+        int32_t weight = exp_q10;
+        int32_t base_sq = (base_q10 * base_q10) >> 10;
+        
+        int32_t linear_part = (base_q10 * weight) >> 10;
+        int32_t curved_part = (base_sq * (1024 - weight)) >> 10;
+        return linear_part + curved_part;
+    } else {
+        if (exp_q10 == 2048) {
+            return (base_q10 * base_q10) >> 10;
+        }
+        
+        int32_t result = 1024;
+        int32_t power = base_q10;
+        int32_t remaining_exp = exp_q10;
+        
+        while (remaining_exp >= 1024) {
+            result = (result * power) >> 10;
+            remaining_exp -= 1024;
+            if (result <= 0) return 0;
+        }
+        
+        if (remaining_exp > 0) {
+            int32_t next_power = (result * power) >> 10;
+            int32_t diff = next_power - result;
+            result += (diff * remaining_exp) >> 10;
+        }
+        
+        return result;
+    }
+}
+
+void mpix_correction_lens_shading_rgb24(const uint8_t *src, uint8_t *dst, uint16_t width,
+                                        uint16_t line_offset, union mpix_correction_any *corr)
+{
+    struct mpix_correction_lens_shading *lsc = &corr->lens_shading;
+
+    int32_t center_x = lsc->center_x;
+    int32_t center_y = lsc->center_y;
+    int32_t strength_q10 = lsc->strength;
+    int32_t exponent_q10 = lsc->exponent;
+
+    uint16_t y = line_offset;
+    int32_t dy = (int32_t)y - center_y;
+    int32_t dy_sq = dy * dy;
+
+    static int32_t cached_max_dist_q10 = 0;
+    static uint16_t cached_width = 0;
+    static uint16_t cached_cx = 0, cached_cy = 0;
+    
+    if (cached_width != width || cached_cx != center_x || cached_cy != center_y) {
+        int32_t max_dx = MAX(center_x, (int32_t)width - center_x);
+        int32_t max_dy = MAX(center_y, (int32_t)line_offset + center_y);
+        int32_t max_distance_sq = max_dx * max_dx + max_dy * max_dy;
+        cached_max_dist_q10 = mpix_sqrt_q10(max_distance_sq << 10);
+        if (cached_max_dist_q10 == 0) cached_max_dist_q10 = 1;
+        
+        cached_width = width;
+        cached_cx = center_x;
+        cached_cy = center_y;
+    }
+
+    for (size_t x = 0; x < width; x++, dst += 3, src += 3) {
+        int32_t dx = (int32_t)x - center_x;
+        int32_t distance_sq = dx * dx + dy_sq;
+
+        int32_t distance_q10 = mpix_sqrt_q10(distance_sq << 10);
+
+        int32_t normalized_q10 = (distance_q10 * 1024) / cached_max_dist_q10;
+        if (normalized_q10 > 1024) normalized_q10 = 1024;
+
+        int32_t factor_q10;
+        
+        if (exponent_q10 == 1024) {
+            factor_q10 = normalized_q10;
+        } else if (exponent_q10 == 2048) {
+            factor_q10 = (normalized_q10 * normalized_q10) >> 10;
+        } else {
+            factor_q10 = mpix_pow_lsc_q10(normalized_q10, exponent_q10);
+        }
+
+        int32_t gain_q10;
+        if (strength_q10 >= 0) {
+            // Positive strength: subtle center darkening, edge brightening
+            int32_t bell_factor = (factor_q10 << 1) - 1024; // 2*factor - 1.0 in Q10
+            gain_q10 = 1024 + ((strength_q10 * bell_factor) >> 12); // >>12 for 1/4 effect
+        } else {
+            // Negative strength: subtle center brightening, edge darkening  
+            int32_t abs_strength = -strength_q10;
+            int32_t bell_factor = (factor_q10 << 1) - 1024; // 2*factor - 1.0 in Q10
+            gain_q10 = 1024 - ((abs_strength * bell_factor) >> 12); // >>12 for 1/4 effect
+        }
+
+        if (gain_q10 < 256) gain_q10 = 256;
+        if (gain_q10 > 4096) gain_q10 = 4096;
+
+        int32_t r = (src[0] * gain_q10) >> 10;
+        int32_t g = (src[1] * gain_q10) >> 10;
+        int32_t b = (src[2] * gain_q10) >> 10;
+
+        dst[0] = CLAMP(r, 0, 255);
+        dst[1] = CLAMP(g, 0, 255);
+        dst[2] = CLAMP(b, 0, 255);
+    }
+}
+MPIX_REGISTER_CORRECTION_OP(lsc_rgb24, mpix_correction_lens_shading_rgb24, LENS_SHADING, RGB24);
+
 static const struct mpix_correction_op **mpix_correction_op_list =
 	(const struct mpix_correction_op *[]){MPIX_LIST_CORRECTION_OP};
 
@@ -195,7 +323,7 @@ int mpix_image_correction(struct mpix_image *img, uint32_t type, union mpix_corr
 	for (size_t i = 0; mpix_correction_op_list[i] != NULL; i++) {
 		const struct mpix_correction_op *tmp = mpix_correction_op_list[i];
 
-		if (tmp->base.fourcc_src == img->fourcc &&
+		if (tmp->base.fourcc_src == img->fourcc && 
 		    tmp->type == type) {
 			op = tmp;
 			break;

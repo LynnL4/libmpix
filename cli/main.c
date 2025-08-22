@@ -514,11 +514,39 @@ static int cmd_correction(int argc, char **argv)
 			corr.color_matrix.levels[i - 2] = ull;
 		}
 
-		break;
-	default:
-		MPIX_ERR("unknown correction type %s", argv[1]);
-		return -EINVAL;
-	}
+			break;
+		case MPIX_CORRECTION_LENS_SHADING:
+			if (argc != 4) {
+				return -EINVAL;
+			}
+
+		
+			corr.lens_shading.center_x = img.width / 2;
+			corr.lens_shading.center_y = img.height / 2;
+			
+			// Strength (-4.0 to 4.0, multiplied by 1024)
+			arg = argv[2];
+			float strength_f = strtof(arg, &arg);
+			if (*argv[2] == '\0' || *arg != '\0' || strength_f < -4.0f || strength_f > 4.0f) {
+				MPIX_ERR("Invalid strength value '%s' (-4.0 to 4.0)", argv[2]);
+				return -EINVAL;
+			}
+			corr.lens_shading.strength = (int16_t)(strength_f * 1024);
+
+			// Exponent (0.1 to 4.0, supports fractional values)
+			arg = argv[3];
+			float exponent_f = strtof(arg, &arg);
+			if (*argv[3] == '\0' || *arg != '\0' || exponent_f < 0.1f || exponent_f > 4.0f) {
+				MPIX_ERR("Invalid exponent value '%s' (0.1 to 4.0)", argv[3]);
+				return -EINVAL;
+			}
+			corr.lens_shading.exponent = (uint16_t)(exponent_f * 1024);
+
+			break;
+		default:
+			MPIX_ERR("unknown correction type %s", argv[1]);
+			return -EINVAL;
+		}
 
 	return mpix_image_correction(&img, type, &corr);
 }
